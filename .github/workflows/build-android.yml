@@ -1,52 +1,195 @@
+# Builds the Android APKs (real app + demo app) and the single-file web demo.
+#
+# Where to find them: GitHub -> Actions -> "Android APKs" -> pick a run -> "Artifacts" at the bottom.
+# Push a tag like v1.0.0 to also attach them to a GitHub Release (easy download link to share).
+#
+# Optional settings (GitHub -> Settings -> Secrets and variables -> Actions):
+#   Variable  API_BASE_URL               e.g. https://shops.example.com  (server the REAL app connects to;
+#                                        if empty, the app asks for the address on first launch)
+#   Secrets   ANDROID_KEYSTORE_BASE64    base64 of your release .jks  -> also builds a signed release APK
+#             ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
 
-name: Build Android APK
+name: Android APKs
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main, master]
+    paths:
+      - 'shopfinder-web/**'
+      - 'demo-desktop/**'
+      - '.github/workflows/android.yml'
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'Server address for the real app (optional, overrides the API_BASE_URL variable)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  apk:
+    name: APK (${{ matrix.flavor }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [app, demo]
+    defaults:
+      run:
+        working-directory: shopfinder-web
+    env:
+      IS_DEMO: ${{ matrix.flavor == 'demo' }}
+      VERSION_NAME: 1.0.${{ github.run_number }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: shopfinder-web/package-lock.json
 
-      - name: Install React dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build React application
-        working-directory: frontend
-        run: npm run build
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: 21
 
-      - name: Sync Capacitor
-        working-directory: frontend
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install packages
+        run: npm ci
+
+      - name: Build web app
+        env:
+          VITE_API_BASE: ${{ inputs.api_url || vars.API_BASE_URL }}
+        run: |
+          if [ "$IS_DEMO" = "true" ]; then npm run build:app:demo; else npm run build:app; fi
+
+      - name: Copy web app into the Android project
         run: npx cap sync android
 
-      - name: Build Android APK
-        working-directory: frontend/android
+      - name: Build debug APK
+        working-directory: shopfinder-web/android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --no-daemon \
+            -PshopfinderDemo=$IS_DEMO \
+            -PappVersionCode=${{ github.run_number }} \
+            -PappVersionName=$VERSION_NAME
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Build signed release APK (only if a keystore secret is set)
+        working-directory: shopfinder-web/android
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "No ANDROID_KEYSTORE_BASE64 secret: skipping the signed release APK (the debug APK installs fine)."
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          export ANDROID_KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+          ./gradlew assembleRelease --no-daemon \
+            -PshopfinderDemo=$IS_DEMO \
+            -PappVersionCode=${{ github.run_number }} \
+            -PappVersionName=$VERSION_NAME
+          rm -f "$RUNNER_TEMP/release.jks"
+
+      - name: Name the APK files
+        run: |
+          mkdir -p out
+          NAME=$([ "$IS_DEMO" = "true" ] && echo "ShopFinder-Demo" || echo "ShopFinder")
+          cp android/app/build/outputs/apk/debug/app-debug.apk "out/$NAME-$VERSION_NAME.apk"
+          if [ -f android/app/build/outputs/apk/release/app-release.apk ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk "out/$NAME-$VERSION_NAME-release.apk"
+          fi
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: ShopFinder-Android-APK
-          path: frontend/android/app/build/outputs/apk/debug/app-debug.apk
+          name: ${{ matrix.flavor == 'demo' && 'ShopFinder-Demo-APK' || 'ShopFinder-APK' }}
+          path: shopfinder-web/out/*.apk
           if-no-files-found: error
+          retention-days: 30
+
+  demo-html:
+    name: Demo (single HTML file)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: shopfinder-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: shopfinder-web/package-lock.json
+      - run: npm ci
+      - run: npm run build:demo-html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShopFinder-Demo-HTML
+          path: shopfinder-web/demo-html/ShopFinder-Demo.html
+          if-no-files-found: error
+          retention-days: 30
+
+  desktop-demo:
+    name: Demo (Windows / Mac / Linux app)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: shopfinder-web/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build demo page
+        working-directory: shopfinder-web
+        run: npm ci && npm run build:demo-html
+      - name: Build desktop apps
+        working-directory: demo-desktop
+        run: |
+          cp ../shopfinder-web/demo-html/ShopFinder-Demo.html app/
+          sh build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShopFinder-Demo-Desktop
+          path: demo-desktop/dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [apk, demo-html, desktop-demo]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: files/*
+          generate_release_notes: true
